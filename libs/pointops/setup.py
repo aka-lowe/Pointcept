@@ -22,7 +22,7 @@ sources = [
 setup(
     name="pointops",
     version="1.0",
-    install_requires=["torch", "numpy"],
+    # install_requires=["torch", "numpy"],
     packages=["pointops"],
     package_dir={"pointops": "functions"},
     ext_modules=[
