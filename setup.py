@@ -25,6 +25,7 @@ setuptools.setup(
     dependency_links=[
         'git+https://github.com/octree-nn/ocnn-pytorch.git,'
         'git+https://github.com/openai/CLIP.git',
-        'git+https://github.com/Dao-AILab/flash-attention.git'
+        'git+https://github.com/Dao-AILab/flash-attention.git',
+        'git+https://github.com/Silverster98/pointops.git'
     ]
 )
