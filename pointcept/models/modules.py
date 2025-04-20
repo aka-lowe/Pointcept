@@ -9,7 +9,7 @@ except ImportError:
 
 from collections import OrderedDict
 from pointcept.models.utils.structure import Point
-from pointcept.engines.hooks import HookBase
+from pointcept.engines.hooks.default import HookBase
 
 
 def is_ocnn_module(module):
