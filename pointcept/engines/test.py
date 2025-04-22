@@ -197,6 +197,12 @@ class SemSegTester(TesterBase):
                         pred_part = self.model(input_dict)["seg_logits"]  # (n, k)
                         # TEMP DBUG INFO
                         print(f"Type of pred_part: {type(pred_part)}")
+
+                        # Ensure pred_part is a standard torch tensor
+                        if not isinstance(pred_part, torch.Tensor):
+                            pred_part = pred_part.tensor if hasattr(pred_part, 'tensor') else torch.tensor(pred_part)
+    
+
                         pred_part = F.softmax(pred_part, -1)
                         if self.cfg.empty_cache:
                             torch.cuda.empty_cache()
