@@ -195,6 +195,8 @@ class SemSegTester(TesterBase):
                     idx_part = input_dict["index"]
                     with torch.no_grad():
                         pred_part = self.model(input_dict)["seg_logits"]  # (n, k)
+                        # TEMP DBUG INFO
+                        print(f"Type of pred_part: {type(pred_part)}")
                         pred_part = F.softmax(pred_part, -1)
                         if self.cfg.empty_cache:
                             torch.cuda.empty_cache()
