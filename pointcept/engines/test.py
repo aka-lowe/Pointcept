@@ -197,6 +197,7 @@ class SemSegTester(TesterBase):
                         pred_part = self.model(input_dict)["seg_logits"]  # (n, k)
                         # TEMP DBUG INFO
                         print(f"Type of pred_part: {type(pred_part)}")
+                        print(f"pred_part: {pred_part}")
 
                         # Ensure pred_part is a standard torch tensor
                         if not isinstance(pred_part, torch.Tensor):
