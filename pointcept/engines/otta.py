@@ -1435,10 +1435,11 @@ class OnlineSemSegTester(SemSegTester):
     def adapt_model(self, input_dict):
         """Perform online model adaptation using CloudFixer's consistency-based approach"""
         # Switch to training mode for adaptation
-        self.feat_model.train()
+        # self.feat_model.train()
         
         # Get original features
         with torch.no_grad():
+
             orig_features = self.feat_model(input_dict)
             
         # Perform multiple adaptation iterations
