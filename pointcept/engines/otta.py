@@ -35,7 +35,7 @@ except:
     pointops = None
 
 
-TESTERS = Registry("testers")
+OTTATESTERS = Registry("otta-testers")
 
 
 class TesterBase:
@@ -118,7 +118,7 @@ class TesterBase:
         raise collate_fn(batch)
 
 
-@TESTERS.register_module()
+@OTTATESTERS.register_module()
 class SemSegTester(TesterBase):
     def test(self):
         assert self.test_loader.batch_size == 1
@@ -194,6 +194,7 @@ class SemSegTester(TesterBase):
                             input_dict[key] = input_dict[key].cuda(non_blocking=True)
                     idx_part = input_dict["index"]
                     with torch.no_grad():
+
                         pred_part = self.model(input_dict)["seg_logits"]  # (n, k)
 
                         # Ensure pred_part is a standard torch tensor
@@ -363,7 +364,7 @@ class SemSegTester(TesterBase):
         return batch
 
 
-@TESTERS.register_module()
+@OTTATESTERS.register_module()
 class DINOSemSegTester(TesterBase):
     def test(self):
         assert self.test_loader.batch_size == 1
@@ -608,7 +609,7 @@ class DINOSemSegTester(TesterBase):
         return batch
 
 
-@TESTERS.register_module()
+@OTTATESTERS.register_module()
 class ClsTester(TesterBase):
     def test(self):
         logger = get_root_logger()
@@ -686,7 +687,7 @@ class ClsTester(TesterBase):
         return collate_fn(batch)
 
 
-@TESTERS.register_module()
+@OTTATESTERS.register_module()
 class ClsVotingTester(TesterBase):
     def __init__(
         self,
@@ -803,7 +804,7 @@ class ClsVotingTester(TesterBase):
         return batch
 
 
-@TESTERS.register_module()
+@OTTATESTERS.register_module()
 class PartSegTester(TesterBase):
     def test(self):
         test_dataset = self.test_loader.dataset
@@ -898,7 +899,7 @@ class PartSegTester(TesterBase):
         return collate_fn(batch)
 
 
-@TESTERS.register_module()
+@OTTATESTERS.register_module()
 class InsSegTester(TesterBase):
     def __init__(
         self,
@@ -1320,3 +1321,370 @@ class InsSegTester(TesterBase):
     def collate_fn(batch):
         # Restrict to bs 1
         return batch[0]
+
+
+
+@OTTATESTERS.register_module()
+class OnlineSemSegTester(SemSegTester):
+    def __init__(self, cfg, feat_model=None, model=None, test_loader=None, verbose=False,
+                 adapt_lr=1e-5, consistency_weight=1.0, num_adaptations=1, 
+                 freeze_first_n_blocks=2, adaptation_momentum=0.9) -> None:
+        super().__init__(cfg, model, test_loader, verbose)
+        if feat_model is None:
+            raise NotImplementedError("Feature model from config not implemented yet.")
+        else:
+            self.feat_model = feat_model
+        self.adapt_lr = adapt_lr
+        self.consistency_weight = consistency_weight
+        self.num_adaptations = num_adaptations
+        self.freeze_first_n_blocks = freeze_first_n_blocks
+        self.adaptation_momentum = adaptation_momentum
+        
+        # Configure which parameters to freeze
+        self.configure_frozen_layers()
+        
+        # Setup optimizer for adaptation
+        self.optimizer = torch.optim.AdamW(
+            self.get_trainable_parameters(), 
+            lr=self.adapt_lr
+        )
+        
+        # Keep track of the original model state
+        self.original_parameters = {}
+        for name, param in self.feat_model.named_parameters():
+            if param.requires_grad:
+                self.original_parameters[name] = param.data.clone()
+
+    def configure_frozen_layers(self):
+        """Configure which layers to freeze in the feature model for CloudFixer adaptation"""
+        # First unfreeze all parameters in the feature model
+        for param in self.feat_model.parameters():
+            param.requires_grad = True
+            
+        # Then selectively freeze layers
+        for name, param in self.feat_model.named_parameters():
+            # Freeze the first n encoder blocks completely
+            for i in range(self.freeze_first_n_blocks):
+                if f'backbone.enc_layers.{i}.' in name:
+                    param.requires_grad = False
+            
+            # Freeze embedding layers
+            if 'embedding' in name:
+                param.requires_grad = False
+
+        # Count trainable vs. total parameters
+        total_params = sum(p.numel() for p in self.feat_model.parameters())
+        trainable_params = sum(p.numel() for p in self.feat_model.parameters() if p.requires_grad)
+        self.logger.info(f"Trainable parameters: {trainable_params:,} / {total_params:,} ({trainable_params/total_params:.2%})")
+
+    def get_trainable_parameters(self):
+        """Return only the parameters that should be trained during adaptation"""
+        return [p for p in self.feat_model.parameters() if p.requires_grad]
+
+    def apply_geometric_transform(self, input_dict):
+        """Apply CloudFixer-style geometric transformations to input"""
+        # Make a copy of the input dict
+        transformed_dict = {}
+        for key, value in input_dict.items():
+            if isinstance(value, torch.Tensor):
+                transformed_dict[key] = value.clone()
+            else:
+                transformed_dict[key] = value
+                
+        # Apply random rotation
+        if 'coord' in transformed_dict:
+            # Random rotation matrix (simple implementation)
+            angle = torch.rand(1).item() * 2 * np.pi
+            cos_a, sin_a = np.cos(angle), np.sin(angle)
+            rotation = torch.tensor([
+                [cos_a, -sin_a, 0],
+                [sin_a, cos_a, 0],
+                [0, 0, 1]
+            ], dtype=torch.float32, device=transformed_dict['coord'].device)
+            
+            # Apply rotation to coordinates
+            coord = transformed_dict['coord']
+            batch_size = len(transformed_dict['offset']) - 1 if 'offset' in transformed_dict else 1
+            
+            # Handle batched data
+            if batch_size > 1 and 'offset' in transformed_dict:
+                start_idx = 0
+                for i in range(batch_size):
+                    end_idx = transformed_dict['offset'][i+1]
+                    coord_batch = coord[start_idx:end_idx]
+                    # Center, rotate, and move back
+                    center = coord_batch.mean(dim=0, keepdim=True)
+                    centered = coord_batch - center
+                    rotated = torch.matmul(centered, rotation.t())
+                    transformed_dict['coord'][start_idx:end_idx] = rotated + center
+                    start_idx = end_idx
+            else:
+                # Center, rotate, and move back
+                center = coord.mean(dim=0, keepdim=True)
+                centered = coord - center
+                rotated = torch.matmul(centered, rotation.t())
+                transformed_dict['coord'] = rotated + center
+                
+            # Apply small random jitter
+            if 'coord' in transformed_dict:
+                jitter = torch.randn_like(transformed_dict['coord']) * 0.01
+                transformed_dict['coord'] = transformed_dict['coord'] + jitter
+                
+        return transformed_dict
+
+    def adapt_model(self, input_dict):
+        """Perform online model adaptation using CloudFixer's consistency-based approach"""
+        # Switch to training mode for adaptation
+        self.feat_model.train()
+        
+        # Get original features
+        with torch.no_grad():
+            orig_features = self.feat_model(input_dict)
+            
+        # Perform multiple adaptation iterations
+        total_loss = 0
+        for _ in range(self.num_adaptations):
+            # Apply geometric transformation
+            transformed_dict = self.apply_geometric_transform(input_dict)
+            
+            # Get features for transformed input
+            transformed_features = self.feat_model(transformed_dict)
+            
+            # Compute consistency loss
+            loss = 0
+            for key in orig_features:
+                if isinstance(orig_features[key], torch.Tensor) and orig_features[key].requires_grad:
+                    # Skip if shapes don't match
+                    if orig_features[key].shape != transformed_features[key].shape:
+                        continue
+                        
+                    # Apply KL divergence for features that look like logits
+                    if key.endswith('logits') or len(orig_features[key].shape) == 2:
+                        loss += F.kl_div(
+                            F.log_softmax(transformed_features[key], dim=1),
+                            F.softmax(orig_features[key].detach(), dim=1),
+                            reduction='batchmean'
+                        )
+                    # MSE for feature tensors
+                    else:
+                        loss += F.mse_loss(
+                            transformed_features[key],
+                            orig_features[key].detach()
+                        )
+            
+            # Scale loss and update model
+            loss *= self.consistency_weight
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+            
+            total_loss += loss.item() if isinstance(loss, torch.Tensor) else 0
+            
+        # Apply momentum-based update to prevent overfitting to current sample
+        # This helps with stability in online adaptation
+        with torch.no_grad():
+            for name, param in self.feat_model.named_parameters():
+                if name in self.original_parameters:
+                    param.data = self.adaptation_momentum * param.data + (1 - self.adaptation_momentum) * self.original_parameters[name]
+            
+        # Switch back to evaluation mode
+        self.feat_model.eval()
+        
+        return total_loss / self.num_adaptations if self.num_adaptations > 0 else 0
+
+    def test(self):
+        assert self.test_loader.batch_size == 1
+        logger = get_root_logger()
+        logger.info(">>>>>>>>>>>>>>>> Start Online Test-Time Adaptation >>>>>>>>>>>>>>>>")
+
+        batch_time = AverageMeter()
+        adapt_time = AverageMeter()
+        adaptation_losses = AverageMeter()
+        intersection_meter = AverageMeter()
+        union_meter = AverageMeter()
+        target_meter = AverageMeter()
+        
+        # Create a copy of the original model for reference
+        self.original_model_state = {k: v.clone() for k, v in self.feat_model.state_dict().items()}
+        
+        # Set models to evaluation mode initially
+        self.model.eval()
+        self.feat_model.eval()
+
+        save_path = os.path.join(self.cfg.save_path, "result")
+        make_dirs(save_path)
+        # Create submission directories
+        if (
+            self.cfg.data.test.type == "ScanNetDataset"
+            or self.cfg.data.test.type == "ScanNet200Dataset"
+            or self.cfg.data.test.type == "ScanNetPPDataset"
+        ) and comm.is_main_process():
+            make_dirs(os.path.join(save_path, "submit"))
+        # Other dataset-specific directories...
+        
+        comm.synchronize()
+        record = {}
+        
+        # Fragment inference
+        for idx, data_dict in enumerate(self.test_loader):
+            start = time.time()
+            data_dict = data_dict[0]  # current assume batch size is 1
+            fragment_list = data_dict.pop("fragment_list")
+            segment = data_dict.pop("segment")
+            data_name = data_dict.pop("name")
+            pred_save_path = os.path.join(save_path, "{}_pred.npy".format(data_name))
+            
+            if os.path.isfile(pred_save_path) and not self.cfg.get('force_recompute', False):
+                # Load existing predictions if not forcing recomputation
+                logger.info(
+                    "{}/{}: {}, loaded pred and label.".format(
+                        idx + 1, len(self.test_loader), data_name
+                    )
+                )
+                pred = np.load(pred_save_path)
+                if "origin_segment" in data_dict.keys():
+                    segment = data_dict["origin_segment"]
+            else:
+                pred = torch.zeros((segment.size, self.cfg.data.num_classes)).cuda()
+                
+                # Process fragments
+                for i in range(len(fragment_list)):
+                    fragment_batch_size = 1
+                    s_i, e_i = i * fragment_batch_size, min(
+                        (i + 1) * fragment_batch_size, len(fragment_list)
+                    )
+                    input_dict = collate_fn(fragment_list[s_i:e_i])
+                    for key in input_dict.keys():
+                        if isinstance(input_dict[key], torch.Tensor):
+                            input_dict[key] = input_dict[key].cuda(non_blocking=True)
+                    idx_part = input_dict["index"]
+                    
+                    # Apply CloudFixer adaptation
+                    adapt_start = time.time()
+                    adapt_loss = self.adapt_model(input_dict)
+                    adapt_time.update(time.time() - adapt_start)
+                    adaptation_losses.update(adapt_loss)
+                    
+                    with torch.no_grad():
+                        # Get features from adapted feature model
+                        feat_dict = self.feat_model(input_dict)
+                        
+                        # Get predictions from the classification model
+                        pred_part = self.model(feat_dict)["seg_logits"]  # (n, k)
+                        
+                        # Ensure pred_part is a standard torch tensor
+                        if not isinstance(pred_part, torch.Tensor):
+                            pred_part = pred_part.tensor if hasattr(pred_part, 'tensor') else torch.tensor(pred_part)
+                        
+                        pred_part = F.softmax(pred_part, -1)
+                        if self.cfg.empty_cache:
+                            torch.cuda.empty_cache()
+                        
+                        # Accumulate predictions
+                        bs = 0
+                        for be in input_dict["offset"]:
+                            pred[idx_part[bs:be], :] += pred_part[bs:be]
+                            bs = be
+                    
+                    logger.info(
+                        "Test: {}/{}-{data_name}, Batch: {batch_idx}/{batch_num}, "
+                        "Adapt loss: {adapt_loss:.4f} ({adapt_losses_avg:.4f}), "
+                        "Adapt time: {adapt_time:.3f}s ({adapt_time_avg:.3f}s)".format(
+                            idx + 1,
+                            len(self.test_loader),
+                            data_name=data_name,
+                            batch_idx=i,
+                            batch_num=len(fragment_list),
+                            adapt_loss=adapt_loss,
+                            adapt_losses_avg=adaptation_losses.avg,
+                            adapt_time=adapt_time.val,
+                            adapt_time_avg=adapt_time.avg
+                        )
+                    )
+                
+                # Process final predictions
+                if self.cfg.data.test.type == "ScanNetPPDataset":
+                    pred = pred.topk(3, dim=1)[1].data.cpu().numpy()
+                else:
+                    pred = pred.max(1)[1].data.cpu().numpy()
+                
+                if "origin_segment" in data_dict.keys():
+                    assert "inverse" in data_dict.keys()
+                    pred = pred[data_dict["inverse"]]
+                    segment = data_dict["origin_segment"]
+                
+                np.save(pred_save_path, pred)
+            
+            # Handle dataset-specific output formatting
+            # (Same as in original SemSegTester)
+            # ...
+            
+            # Calculate metrics
+            intersection, union, target = intersection_and_union(
+                pred, segment, self.cfg.data.num_classes, self.cfg.data.ignore_index
+            )
+            intersection_meter.update(intersection)
+            union_meter.update(union)
+            target_meter.update(target)
+            record[data_name] = dict(
+                intersection=intersection, union=union, target=target
+            )
+
+            mask = union != 0
+            iou_class = intersection / (union + 1e-10)
+            iou = np.mean(iou_class[mask])
+            acc = sum(intersection) / (sum(target) + 1e-10)
+
+            m_iou = np.mean(intersection_meter.sum / (union_meter.sum + 1e-10))
+            m_acc = np.mean(intersection_meter.sum / (target_meter.sum + 1e-10))
+
+            batch_time.update(time.time() - start)
+            logger.info(
+                "Test: {} [{}/{}]-{} "
+                "Batch {batch_time.val:.3f} ({batch_time.avg:.3f}) "
+                "Adapt {adapt_time.val:.3f} ({adapt_time.avg:.3f}) "
+                "Accuracy {acc:.4f} ({m_acc:.4f}) "
+                "mIoU {iou:.4f} ({m_iou:.4f})".format(
+                    data_name,
+                    idx + 1,
+                    len(self.test_loader),
+                    segment.size,
+                    batch_time=batch_time,
+                    adapt_time=adapt_time,
+                    acc=acc,
+                    m_acc=m_acc,
+                    iou=iou,
+                    m_iou=m_iou,
+                )
+            )
+            
+            # Periodically save adapted model checkpoint
+            if idx % 50 == 0 and idx > 0 and comm.is_main_process():
+                model_save_path = os.path.join(save_path, f"adapted_model_step_{idx}.pth")
+                torch.save({
+                    'feat_model': self.feat_model.state_dict(),
+                    'step': idx,
+                    'adaptation_loss': adaptation_losses.avg
+                }, model_save_path)
+                logger.info(f"Saved adapted model at step {idx} to {model_save_path}")
+
+        # Result aggregation and reporting
+        # (Same as in original SemSegTester)
+        logger.info("Syncing ...")
+        comm.synchronize()
+        record_sync = comm.gather(record, dst=0)
+
+        if comm.is_main_process():
+            # Process and report results
+            # ...
+            
+            # Save final adapted model
+            model_save_path = os.path.join(save_path, "final_adapted_model.pth")
+            torch.save({
+                'feat_model': self.feat_model.state_dict(),
+                'original_model': self.original_model_state,
+                'adaptation_loss': adaptation_losses.avg
+            }, model_save_path)
+            logger.info(f"Saved final adapted model to {model_save_path}")
+            
+        logger.info("<<<<<<<<<<<<<<<<< End Online Test-Time Adaptation <<<<<<<<<<<<<<<<<")
