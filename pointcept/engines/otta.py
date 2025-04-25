@@ -1546,9 +1546,8 @@ class OnlineSemSegTester(SemSegTester):
                 if "origin_segment" in data_dict.keys():
                     segment = data_dict["origin_segment"]
             else:
-                pred = torch.zeros((segment.size, self.cfg.data.num_classes)).cuda()
                 
-                # Process fragments
+                pred = torch.zeros((segment.size, self.cfg.data.num_classes)).cuda()
                 for i in range(len(fragment_list)):
                     fragment_batch_size = 1
                     s_i, e_i = i * fragment_batch_size, min(
