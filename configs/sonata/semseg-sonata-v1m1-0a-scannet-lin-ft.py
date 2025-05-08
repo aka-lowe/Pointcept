@@ -10,7 +10,7 @@ enable_amp = True
 
 # model settings
 model = dict(
-    type="DefaultSegmentorV2",
+    type="CustomSegmentorWithHeadFromConfig",
     num_classes=20,
     backbone_out_channels=1232,
     backbone=dict(

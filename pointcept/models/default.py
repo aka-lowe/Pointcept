@@ -9,6 +9,96 @@ from pointcept.models.utils import offset2batch
 from .builder import MODELS, build_model
 
 
+import torch
+import torch.nn as nn
+
+from pointcept.models.losses import build_criteria
+from pointcept.models.utils.structure import Point
+from .builder import MODELS, build_model
+
+@MODELS.register_module()
+class CustomSegmentorWithHeadFromConfig(nn.Module):
+    def __init__(
+        self,
+        backbone=None,
+        num_classes=None,
+        backbone_out_channels=None,
+        criteria=None,
+        freeze_backbone=False,
+    ):
+        super().__init__()
+        self.backbone = build_model(backbone)
+        self.decode_head = nn.Linear(backbone_out_channels, num_classes)  # Initialize the linear layer
+
+        # Load the checkpoint
+        ckpt_data = torch.load("./models/sonata/sonata_linear_prob_head_sc.pth", map_location=torch.device("cpu"), weights_only=True)
+
+        # Extract the state_dict if it exists
+        if "state_dict" in ckpt_data:
+            head_state_dict = ckpt_data["state_dict"]
+        else:
+            head_state_dict = ckpt_data  # Assume the loaded data is directly the state_dict
+
+        corrected_head_state_dict = {}
+        for k, v in head_state_dict.items():
+            if k.startswith("seg_head."): # Adjust the prefix if necessary based on Sonata's naming
+                corrected_head_state_dict[k.replace("seg_head.", "")] = v
+            else:
+                corrected_head_state_dict[k] = v
+
+        try:
+            self.decode_head.load_state_dict(corrected_head_state_dict, strict=True)
+            print("Successfully loaded classification head weights.")
+        except RuntimeError as e:
+            print(f"Error loading classification head weights: {e}")
+            print("Check the key mappings and layer structure.")
+
+        self.criteria = build_criteria(criteria)
+        self.freeze_backbone = freeze_backbone
+        if self.freeze_backbone:
+            for p in self.backbone.parameters():
+                p.requires_grad = False
+
+    def forward(self, input_dict, return_point=False):
+        point = Point(input_dict)
+        point = self.backbone(point)
+
+        # # Handle the case where the backbone returns features directly
+        # if isinstance(point, Point):
+        #     feat = point.feat
+        # else:
+        #     feat = point
+        if isinstance(point, Point):
+            while "pooling_parent" in point.keys():
+                assert "pooling_inverse" in point.keys()
+                parent = point.pop("pooling_parent")
+                inverse = point.pop("pooling_inverse")
+                parent.feat = torch.cat([parent.feat, point.feat[inverse]], dim=-1)
+                point = parent
+            feat = point.feat
+        else:
+            feat = point
+
+        seg_logits = self.decode_head(feat)
+
+        return_dict = dict()
+        if return_point:
+            return_dict["point"] = point
+
+        # train
+        if self.training:
+            loss = self.criteria(seg_logits, input_dict["segment"])
+            return_dict["loss"] = loss
+        # eval
+        elif "segment" in input_dict.keys():
+            loss = self.criteria(seg_logits, input_dict["segment"])
+            return_dict["loss"] = loss
+            return_dict["seg_logits"] = seg_logits
+        # test
+        else:
+            return_dict["seg_logits"] = seg_logits
+        return return_dict
+
 @MODELS.register_module()
 class DefaultSegmentor(nn.Module):
     def __init__(self, backbone=None, criteria=None):
