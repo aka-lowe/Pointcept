@@ -307,12 +307,13 @@ class ScanNetRGBDDataset(DefaultDataset):
     def rgbd_to_pointcloud_with_labels(self, color_image, depth_image, pose, depth_intrinsic, scene_id):
         """
         Convert RGB-D frame to point cloud and assign original mesh labels
+        Using the proper inverse camera projection: P = R^T · (D_p · K^(-1) · p̃) - R^T t
         
         Args:
             color_image: RGB image (H, W, 3)
             depth_image: Depth image (H, W)
-            pose: Camera pose matrix (4, 4)
-            depth_intrinsic: Camera intrinsic matrix (3, 3)
+            pose: Camera pose matrix (4, 4) = [R t; 0 1]
+            depth_intrinsic: Camera intrinsic matrix K (3, 3)
             scene_id: Scene identifier for label projection
             
         Returns:
@@ -342,20 +343,26 @@ class ScanNetRGBDDataset(DefaultDataset):
             empty_labels = np.array([], dtype=np.int32)
             return empty, empty, empty, empty_labels, empty_labels
         
-        # Convert to 3D camera coordinates
-        fx, fy = depth_intrinsic[0, 0], depth_intrinsic[1, 1]
-        cx, cy = depth_intrinsic[0, 2], depth_intrinsic[1, 2]
-        
-        x = (u - cx) * depth_values / fx
-        y = (v - cy) * depth_values / fy
-        z = depth_values
-        
         # Convert depth units (ScanNet depth is in mm, convert to meters)
-        points_camera = np.stack([x, y, z], axis=1) / 1000.0
+        depth_values = depth_values / 1000.0
         
-        # Transform to world coordinates
-        points_homogeneous = np.concatenate([points_camera, np.ones((len(points_camera), 1))], axis=1)
-        points_world = (pose @ points_homogeneous.T).T[:, :3]
+        # Create homogeneous pixel coordinates p̃ = [u, v, 1]
+        pixel_coords_homogeneous = np.stack([u, v, np.ones_like(u)], axis=1)  # (N, 3)
+        
+        # Extract rotation R and translation t from pose matrix
+        R = pose[:3, :3]  # (3, 3)
+        t = pose[:3, 3]   # (3,)
+        
+        # Compute K^(-1) · p̃ for all pixels
+        K_inv = np.linalg.inv(depth_intrinsic)
+        normalized_coords = (K_inv @ pixel_coords_homogeneous.T).T  # (N, 3)
+        
+        # Apply depth: D_p · K^(-1) · p̃
+        points_camera = normalized_coords * depth_values[:, np.newaxis]  # (N, 3)
+        
+        # Transform to world coordinates: P = R^T · (D_p · K^(-1) · p̃) - R^T t
+        R_T = R.T  # (3, 3)
+        points_world = (R_T @ points_camera.T).T - (R_T @ t)  # (N, 3)
         
         # Get colors for valid points
         colors = color_image[v, u] / 255.0  # Normalize to [0, 1]
