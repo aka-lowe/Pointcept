@@ -74,7 +74,7 @@ class MeshLabelProjector:
         
         # File paths
         mesh_path = os.path.join(scene_path, f"{scene_id}_vh_clean_2.labels.ply")
-        aggregation_path = os.path.join(scene_path, f"{scene_id}_vh_clean_2.aggregation.json")
+        aggregation_path = os.path.join(scene_path, f"{scene_id}_vh_clean.aggregation.json")
         segments_path = os.path.join(scene_path, f"{scene_id}_vh_clean_2.0.010000.segs.json")
         
         if not all(os.path.exists(p) for p in [mesh_path, aggregation_path, segments_path]):
@@ -192,7 +192,7 @@ class ScanNetRGBDDataset(DefaultDataset):
         # Original mesh projection parameters
         use_original_labels: bool = True,
         mesh_projection_distance: float = 0.05,
-        labels_pd_path: str = "meta_data/scannetv2-labels.combined.tsv",
+        labels_pd_path: str = "/zhome/c8/c/169006/Repos/Ego3D-TTA/data/ego-rgbd/meta_data/scannetv2-labels.combined.tsv",
         
         # Original parameters
         sam_folder: str = "sam",
@@ -228,14 +228,14 @@ class ScanNetRGBDDataset(DefaultDataset):
         self.add_instance = add_instance
         self.ignore_label = ignore_label
         self.max_frames = max_frames
+        self.data_root = kwargs.get('data_root', '/dtu/datasets2/ScanNet/ScanNetV2/')
         
         # Handle scenes to exclude
         self.excluded_scenes = set()
         if scenes_to_exclude:
             self.excluded_scenes.update(scene.strip() for scene in scenes_to_exclude.split(',') if scene.strip())
         
-        # Initialize parent class
-        super().__init__(**kwargs)
+
         
         # Initialize label projector if using original labels
         if self.use_original_labels:
@@ -256,6 +256,9 @@ class ScanNetRGBDDataset(DefaultDataset):
                 split_dir=self.sens_split_dir,
                 frame_skip=self.frame_skip
             )
+
+        # Initialize parent class
+        super().__init__(**kwargs)
         
         logger = get_root_logger()
         logger.info(f"ScanNet RGB-D Dataset initialized with {len(self.data_list)} samples")
@@ -269,9 +272,10 @@ class ScanNetRGBDDataset(DefaultDataset):
         else:
             # Use traditional approach with extracted data
             if self.split == "train":
+                data_path = Path(self.data_root)
                 data_path = os.path.join(self.data_root, 'scannet_train.txt')
             else:
-                data_path = os.path.join(self.data_root, 'scannet_val.txt')
+                data_path = os.path.join(os.path.parentdir(self.data_root), 'scannet_val.txt')
                 
             with open(data_path, "r") as scene_file:
                 scene_lines = scene_file.read().splitlines()
