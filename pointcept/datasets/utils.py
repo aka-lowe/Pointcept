@@ -49,11 +49,39 @@ def collate_fn(batch):
         return default_collate(batch)
 
 
-def point_collate_fn(batch, mix_prob=0):
+def point_collate_fn(batch, mix_prob=0, ignore_index=None):
     assert isinstance(
         batch[0], Mapping
     )  # currently, only support input_dict, rather than input_list
-    batch = collate_fn(batch)
+
+    
+    # --- filter fragment-level empties before concatenation ---
+    kept = []
+    for item in batch:
+        ok = True
+        # 0 points?
+        pts = item.get("coord") or item.get("point") or item.get("points")
+        if isinstance(pts, torch.Tensor) and pts.numel() == 0:
+            ok = False
+        # 0 valid labels?
+        seg = item.get("segment")
+        if isinstance(seg, torch.Tensor):
+            if seg.numel() == 0:
+                ok = False
+            elif ignore_index is not None and (seg != ignore_index).sum().item() == 0:
+                ok = False
+        if ok:
+            kept.append(item)
+
+    # If filtering removed everything, fall back to original batch.
+    # The Criteria/model guard will make empties contribute 0.0 instead of crashing.
+    if kept:
+        batch = collate_fn(kept)
+    else:
+        batch = collate_fn(batch)
+    
+
+    # batch = collate_fn(batch)
     if random.random() < mix_prob:
         if "instance" in batch.keys():
             offset = batch["offset"]
