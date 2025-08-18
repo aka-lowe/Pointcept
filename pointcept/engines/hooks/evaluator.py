@@ -124,6 +124,9 @@ class SemSegEvaluator(HookBase):
                 if isinstance(input_dict[key], torch.Tensor):
                     input_dict[key] = input_dict[key].cuda(non_blocking=True)
             with torch.no_grad():
+                if input_dict["segment"].shape[0] == 0:
+                    print("Empt pred")
+                    continue
                 output_dict = self.trainer.model(input_dict)
             output = output_dict["seg_logits"]
             loss = output_dict["loss"]
